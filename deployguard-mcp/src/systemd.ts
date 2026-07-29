@@ -116,17 +116,19 @@ async function checkExecutable(user: string, bin: string): Promise<{ ok: true } 
 
   const canExec = (await runChecked("runuser", ["-u", user, "--", "test", "-x", bin])).code === 0;
   if (!canExec) {
+    const binName = bin.split("/").pop();
     return {
       ok: false,
       reason:
         `service account "${user}" cannot execute "${bin}" — most likely a parent directory isn't ` +
-        "traversable by that account. This is common with Node installed via nvm (e.g. /root/.nvm or " +
-        "/home/*/.nvm are 0700/0750 by default, unreadable to any other account) — nvm is designed for one " +
-        "interactive login shell, not a locked-down system account. Fix by exposing the runtime system-wide " +
-        `instead of relying on the nvm path: e.g. \`ln -s "$(command -v ${bin.split("/").pop()})" /usr/local/bin/${bin
-          .split("/")
-          .pop()}\` (run as the user who has nvm sourced), or install this runtime via your distro's package ` +
-        "manager / NodeSource instead of a per-user version manager. Then retry with the new path.",
+        "traversable by that account. This is common with Node/Python installed via a per-user version " +
+        "manager (nvm, pyenv) under a home directory that's 0700/0750 by default (e.g. /root/.nvm, " +
+        "/home/*/.nvm) — those tools are designed for one interactive login shell, not a locked-down system " +
+        `account. Fix by COPYING the binary out to a system-wide location — \`cp "$(command -v ${binName})" ` +
+        `/usr/local/bin/${binName} && chmod 755 /usr/local/bin/${binName}\` — not a symlink: a symlink still ` +
+        "resolves through the original restricted directory when the service account tries to open it, so it " +
+        "fails the exact same way. Installing the runtime via your distro's package manager/NodeSource instead " +
+        "of a per-user version manager avoids this entirely. Then retry with the new path.",
     };
   }
 
