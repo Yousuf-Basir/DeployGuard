@@ -119,6 +119,15 @@ function sanitizeProfileName(path: string): string {
   return `deployguard.${cleaned || "app"}`;
 }
 
+// AppArmor's standard profile directory — apparmor_parser and apparmor.d
+// tooling expect profiles here, so apparmor.apply_profile (Stage 6) can
+// load a known path instead of needing the profile text passed around.
+const PROFILE_DIR = "/etc/apparmor.d";
+
+export function profileFilePath(path: string): string {
+  return `${PROFILE_DIR}/${sanitizeProfileName(path)}`;
+}
+
 // These four denials apply at every level, per plan.md §3.3.1 — no level
 // is allowed to escalate past this floor.
 function alwaysDenyRules(): string {
@@ -196,9 +205,9 @@ export function registerApparmor(server: McpServer) {
     {
       description:
         "Builds an AppArmor confinement profile for a project/app directory at a chosen restriction level " +
-        "(low/medium/high) — produces the profile text for review only, does not load or apply it. Call this " +
-        "when the user wants to sandbox, confine, or harden an app with AppArmor, or asks to 'secure my app'. " +
-        "Use apparmor.apply_profile afterwards to actually load the generated profile.",
+        "(low/medium/high) — produces the profile text for review only, does not write, load, or apply it. " +
+        "Call this when the user wants to sandbox, confine, or harden an app with AppArmor, or asks to " +
+        "'secure my app'. Use apparmor.apply_profile afterwards to write and load the profile for real.",
       inputSchema: {
         path: z.string(),
         type: z.enum(["web-service"]),
