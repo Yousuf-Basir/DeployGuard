@@ -6,6 +6,7 @@ import { registerFail2ban } from "./fail2ban.js";
 import { registerApt } from "./apt.js";
 import { registerApparmor } from "./apparmor.js";
 import { registerServiceUser } from "./serviceuser.js";
+import { registerSystemd } from "./systemd.js";
 import { registerReport } from "./report.js";
 
 const server = new McpServer(
@@ -26,6 +27,7 @@ registerFail2ban(server);
 registerApt(server);
 registerApparmor(server);
 registerServiceUser(server);
+registerSystemd(server);
 registerReport(server);
 
 await server.connect(new StdioServerTransport());
