@@ -19,7 +19,7 @@ export interface UnitInput {
 // Every unit DeployGuard creates lives here and carries this prefix —
 // callers only ever supply the short app name, tools derive the rest, so
 // Stage 10's apps.list can reliably enumerate by the "deployguard-*" glob.
-const UNIT_DIR = "/etc/systemd/system";
+export const UNIT_DIR = "/etc/systemd/system";
 
 export function unitName(name: string): string {
   return `deployguard-${name}`;
