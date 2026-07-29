@@ -209,12 +209,14 @@ export interface ApplyProfileResult {
   [key: string]: unknown;
 }
 
-// apparmor_parser's long options for forcing a profile's mode regardless of
-// what flags= it was written with — Complain/Enforce, capitalized, unlike
-// the lowercase mode values this tool's own input/output use.
-const PARSER_MODE_FLAG: Record<ApparmorMode, string> = {
-  complain: "--Complain",
-  enforce: "--Enforce",
+// apparmor_parser (3.0.4, confirmed on the Ubuntu 22.04 test VPS) only has a
+// flag to force *complain* mode (-C/--Complain) — there is no "--Enforce"
+// counterpart. Enforce is simply the parser's default behavior when that
+// flag is omitted (our generated profiles never set flags=(complain)
+// themselves), so the enforce case passes no extra flag at all.
+const PARSER_MODE_FLAGS: Record<ApparmorMode, string[]> = {
+  complain: ["--Complain"],
+  enforce: [],
 };
 
 // Stage 6: writes the profile (rebuilt from the same {path, type, level}
@@ -250,7 +252,7 @@ export async function applyProfile(
     };
   }
 
-  const { code, stderr } = await runChecked("apparmor_parser", ["-r", PARSER_MODE_FLAG[mode], file]);
+  const { code, stderr } = await runChecked("apparmor_parser", ["-r", ...PARSER_MODE_FLAGS[mode], file]);
 
   if (code !== 0) {
     return {
