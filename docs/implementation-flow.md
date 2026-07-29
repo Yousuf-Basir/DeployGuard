@@ -57,25 +57,64 @@ A sequenced task list for building the server described in [mcp-server-implement
 22. Register `apparmor.generate_profile` with input `{ path, type, level }`. This tool produces a profile rather than a pass/warn/fail judgment, so it doesn't extend `checkResultShape` — `outputSchema` is just `{ profile: z.string() }`.
 23. **Check:** call it against a real project directory, read the generated profile text by eye — does it look like a sane AppArmor profile, does the low/medium/high difference actually show up in the output?
 
-## Stage 6 — AppArmor Apply (Guarded)
+## Stage 6 — AppArmor Apply (Guarded, Load-Only)
 
-**Goal:** close the loop on Use Case B — actually load the profile, safely.
+**Goal:** load a generated profile into the kernel, safely. Binding it to an actual running process is no longer this tool's job — that's Stage 8, via systemd's own `AppArmorProfile=` directive, not `aa-exec` or exec-transition wrapper scripts (see plan.md §3.5 for why that idea was dropped: it can't scope a profile to one app when multiple apps share the same interpreter binary).
 
-24. Write `apparmor.apply_profile` with input `{ path, mode: "complain" | "enforce", confirm: true }` — calls `apparmor_parser -r --<mode>`. `outputSchema` extends `checkResultShape` with `mode`.
+24. Write `apparmor.apply_profile` with input `{ path, mode: "complain" | "enforce", confirm: true }` — calls `apparmor_parser -r --<mode>` against the profile file at `profileFilePath(path)`. `outputSchema` extends `checkResultShape` with `mode`.
 25. Wire the `confirm: true` requirement so the tool call fails fast without it (no separate confirm-gate module needed at this size — a required literal field in the schema is enough).
-26. **Check:** on a disposable test project — generate a profile, apply in `complain` mode, exercise the app, confirm no unexpected denials in `dmesg`/`journalctl`, then apply in `enforce` mode and re-verify the app still works.
+26. **Check:** load a generated profile in `complain` mode, confirm no unexpected denials in `dmesg`/`journalctl`, then apply in `enforce` mode. Since nothing is bound to a process yet, this check only confirms the profile loads without a syntax error — real enforcement behavior gets verified once a systemd unit references it in Stage 8.
 
-## Stage 7 — Full Guided Flow, End to End
+## Stage 7 — Dedicated Service User (DAC)
 
-**Goal:** validate Use Case B exactly as a real user would run it — this is the actual product, not just its parts.
+**Goal:** give each deployed app its own unprivileged Unix account, so file-ownership isolation between apps doesn't depend on AppArmor being correctly configured — a second, independent layer per plan.md §3.5. This has to exist before Stage 8's systemd unit, since the unit's `User=`/`Group=` reference this account.
 
-27. Point a connected agent at a real (or disposable) Next.js project directory and ask it to "secure this app."
-28. Confirm the agent: reads the project unprompted, asks for a restriction level, calls `generate_profile`, shows you the result, asks for confirmation, applies in `complain` mode, then asks again before `enforce`.
-29. Fix whatever's awkward in the tool descriptions/output — this is where you'll discover if a tool's returned text is confusing to the model, not in the code review.
+27. Write `src/serviceuser.ts`: `serviceuser.create` with input `{ path, name, confirm: true }` — checks whether the account already exists (`id <name>`) and skips creation if so (redeploys reuse the same account, this must be a safe no-op), otherwise runs `useradd --system --no-create-home --shell /usr/sbin/nologin <name>`, then always `chown -R <name>:<name> <path>`.
+28. Register the tool with `outputSchema` extending `checkResultShape` with `username`. Enforce-tier: requires `confirm: true`, same pattern as `apparmor.apply_profile`.
+29. **Check:** run against a disposable test directory — confirm the user is created (`id <name>`) and the directory is re-owned (`stat` shows the new owner); run it a second time and confirm it's a safe no-op, not an error, since Stage 9's redeploy flow depends on that.
+
+## Stage 8 — systemd Unit: Generate + Apply
+
+**Goal:** the piece that actually ties DAC + MAC + resource limits together — this is what runs the app, replacing PM2 or any other process manager for anything DeployGuard deploys.
+
+30. Write `src/systemd.ts`: `buildUnit({ name, path, user, startCommand, appArmorProfile, cpuQuota?, memoryMax? })` — a template function (same shape as `buildProfile` in `apparmor.ts`) producing unit file text with `User=`, `Group=`, `WorkingDirectory=`, `ExecStart=`, `AppArmorProfile=`, and the optional resource-limit directives. `startCommand` is supplied by the calling agent, same principle as `apparmor.generate_profile`'s `path` — DeployGuard doesn't parse `package.json` or detect frameworks itself. The tool always derives the actual unit name as `deployguard-<name>` — callers only ever pass the short app name, never the full unit filename, so Stage 10's `apps.list` can reliably enumerate by the `deployguard-*` prefix.
+31. Register `systemd.generate_unit` — text-only, mirrors `apparmor.generate_profile`: input `{ name, path, user, startCommand, appArmorProfile, cpuQuota?, memoryMax? }`, `outputSchema` is just `{ unit: z.string() }`, no write, no `systemctl` call.
+32. Register `systemd.apply_unit` — input adds `confirm: true`. Writes the unit to `/etc/systemd/system/deployguard-<name>.service`, ensures the referenced AppArmor profile is loaded (reuse `apparmor.apply_profile`'s logic instead of re-implementing it), then `systemctl daemon-reload` + `systemctl enable --now deployguard-<name>`. `outputSchema` extends `checkResultShape`. Also write `parseUnitFile(unitFile)` here (not in a new file) — reads an installed unit back into `{ user, path, startCommand, appArmorProfile, cpuQuota?, memoryMax? }`, since Stage 10's `apps.list` and `apps.update_limits` both need this and shouldn't duplicate it.
+33. **Check:** on a disposable Next.js project — generate the unit, review it, apply it, confirm `systemctl status deployguard-<name>` shows it running as the service user; confirm `aa-status` now lists the process under the profile, not unconfined (this is the first real end-to-end confinement check, since Stage 6 alone couldn't prove it); and if you set `CPUQuota=`/`MemoryMax=`, confirm it's visible via `systemctl show deployguard-<name> --property=CPUQuotaPerSecUSec,MemoryMax`.
+
+## Stage 9 — Deploy Updates (Redeploy Flow)
+
+**Goal:** the ongoing half of the product, not just first deploy — pulling new commits without breaking the DAC boundary Stage 7 set up.
+
+34. Write `src/deploy.ts`: `deploy.update` with input `{ name, path, buildCommand?, confirm: true }`. Look up the directory's actual owning user via `stat` (the real owner is the source of truth — don't assume a naming convention matches), then run `runuser -u <owner> -- bash -c "cd <path> && git pull && <buildCommand>"` — **never as root or the calling SSH/agent user**, since files pulled under the wrong owner would silently break the isolation Stage 7 set up.
+35. After a successful pull+build, `systemctl restart <name>`.
+36. `outputSchema` extends `checkResultShape`, capturing the pull/build output so the agent can show it on failure rather than swallowing a failed `git pull` or build error.
+37. **Check:** commit a real change to a disposable test app's repo, run `deploy.update`, confirm the change is live — and confirm the pulled files are owned by the service user, not root or whoever ran the agent. That ownership check is the one that actually proves the DAC boundary survived a redeploy, not just the initial deploy.
+
+## Stage 10 — App Lifecycle Management
+
+**Goal:** the PM2-equivalent day-2 surface — list, stop, restart, remove, adjust resource limits, and read logs for anything DeployGuard has deployed. Depends on Stage 8's `deployguard-<name>` naming convention and `parseUnitFile` helper already existing.
+
+38. Write `src/apps.ts`: `apps.list` — scans `/etc/systemd/system/deployguard-*.service` (not just currently-running units, so a stopped app still shows up), calls `parseUnitFile` (from `systemd.ts`) plus `systemctl is-active`/`is-enabled` per unit. `outputSchema` extends `checkResultShape` with `apps: Array<{ name, unit, active, enabled, user, path, profile }>` — `warn` if any app isn't active, `ok` otherwise (zero apps is `ok`, not a failure).
+39. Register `apps.stop` and `apps.restart` — `{ name, confirm: true }`, call `systemctl stop|restart deployguard-<name>`. `outputSchema` extends `checkResultShape`.
+40. Register `apps.remove` — `{ name, confirm: true }`, calls `systemctl stop`, `systemctl disable`, deletes the unit file, `daemon-reload`. **Scope this deliberately narrow**: don't delete the project directory, service account, or AppArmor profile — those are separate, harder-to-reverse actions, not this tool's job (see plan.md §6 Open Questions on whether a fuller teardown tool is ever wanted).
+41. Register `apps.update_limits` — `{ name, cpuQuota?, memoryMax?, confirm: true }`: `parseUnitFile` the installed unit, rebuild via `buildUnit` with the new limit values substituted in (keeping the existing `user`/`path`/`startCommand`/`appArmorProfile`), rewrite, `daemon-reload`, restart. No new state store — the installed unit file is the only source of truth.
+42. Register `apps.get_logs` — `{ name, lines?: number, since?: string }`, wraps `journalctl -u deployguard-<name> -n <lines> --no-pager [--since <since>]`. Read-only, no `confirm` field at all — `outputSchema` is just `{ logs: z.string() }`, same non-`checkResultShape` pattern as `apparmor.generate_profile`.
+43. **Check:** against a disposable deployed app — `apps.list` shows it; `apps.stop` then `apps.list` again shows it as inactive (not missing — this is the check that `apps.list` scans installed units, not just running ones); `apps.restart` brings it back; `apps.update_limits` with a new `MemoryMax=` is visible via `systemctl show`; `apps.get_logs` returns real `journalctl` output; `apps.remove` deletes the unit but leaves the project directory and service account (`id <user>`) intact — verify that last part explicitly, since it's the one a careless implementation would get wrong.
+
+## Stage 11 — Full Guided Flow, End to End
+
+**Goal:** validate the real product — deploying a fresh app securely, redeploying it, and managing it day-to-day — exactly as a real user would ask for it.
+
+44. Point a connected agent at a real (or disposable) Next.js project's Git repo and ask it to **"deploy this application with high restriction."**
+45. Confirm the agent: reads the project unprompted (to determine the start command), asks for a restriction level if not given, then in order — `apparmor.generate_profile` → shows the result → confirms → `apparmor.apply_profile` (complain, then enforce) → `serviceuser.create` (confirm) → `systemd.generate_unit` → shows the unit → confirms → `systemd.apply_unit` (confirm).
+46. Push a real change to the app's repo and ask the agent to **"deploy the latest update."** Confirm it calls `deploy.update` rather than a manual `git pull` over a shell tool, and that the app comes back up running as the same service user under the same profile.
+47. Ask **"list all applications deployed by DeployGuard"** — confirm `apps.list` is called (not the agent trying to reconstruct this via raw `systemctl`/`ps` shell commands) and the deployed app shows up correctly. Then ask to stop it, restart it, set a resource limit, and show its logs — confirm each maps to the right `apps.*` tool, not a manual shell command.
+48. Fix whatever's awkward in the tool descriptions/output — same rule as every earlier stage's check: this is where model confusion actually surfaces, not in code review.
 
 ## What Comes After This
 
-Once Stages 0–7 are done, v1 is complete per [mcp-server-implementation.md](mcp-server-implementation.md#6-whats-deliberately-left-out-for-now). Do not start these until there's a real need:
+Once Stages 0–11 are done, v1 is complete per [mcp-server-implementation.md](mcp-server-implementation.md#6-whats-deliberately-left-out-for-now). Do not start these until there's a real need:
 
 - `firewall.enforce_baseline` (closing ports directly)
 - `iptables`/`firewalld` adapters alongside `ufw`
@@ -83,3 +122,10 @@ Once Stages 0–7 are done, v1 is complete per [mcp-server-implementation.md](mc
 - Non-Debian OS support
 - Config-file-driven APT allowlist
 - Fleet/multi-server support
+- PM2 support as an alternative to the systemd-based deploy flow — deliberately dropped in favor of systemd, see plan.md §3.5.
+- Framework/build-tool auto-detection inside a DeployGuard tool (parsing `package.json`, guessing a start command) — the agent reads the project and supplies these explicitly, same as it already does for `apparmor.generate_profile`'s `path`.
+- Resource type templates beyond `web-service` (`script`, `background-service`, `project-runtime`) — new template functions added when a real use case needs them, not upfront.
+- Multiple apps sharing one service account — one dedicated account per app for now.
+- Full teardown (deleting the service account, project files, and AppArmor profile alongside the unit) — `apps.remove` deliberately stays scoped to just the systemd unit.
+- Structured/parsed log output from `apps.get_logs` — raw `journalctl` text only.
+- Bulk operations across all deployed apps at once — every lifecycle tool takes one app name at a time.

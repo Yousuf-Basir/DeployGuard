@@ -8,16 +8,30 @@ Keep this simple: one server, one file per check, no framework layers. The goal 
 
 **A. Ad-hoc security scan.** Agent calls the read-only checks (firewall, fail2ban, AppArmor, APT sources) anytime and reports back pass/warn/fail. No project context needed — this is "how's this server doing right now."
 
-**B. Guided app hardening.** The flow you actually want, e.g. for a Next.js app:
+**B. Guided secure deployment.** The flow you actually want, e.g. for a Next.js app — and note this is **deploying an app DeployGuard will own**, not just hardening one that's already running under something else (PM2, a bare `node` process). That distinction matters because it's also responsible for **redeploying updates** to that same app later, and once the project directory belongs to its own dedicated Unix account (step 4 below), pulling new code has to happen as that account, not as root or whichever user is running the agent.
 
-1. User points the agent at a project directory ("secure my app at `/var/www/myapp`").
-2. Agent reads the project itself (`package.json`, framework, port it binds, what it writes to) — that's normal file reading, not an MCP tool.
-3. Agent asks the user to pick a restriction level: **Low / Medium / High** (per plan.md §3.3.1).
-4. Agent calls `apparmor.generate_profile` on the MCP server with `{ path, type: "web-service", level }`. The server builds an AppArmor profile from a template for that level and returns it — not yet applied.
-5. Agent shows the user the generated profile (what it allows/denies) and asks for confirmation.
-6. On confirmation, agent calls `apparmor.apply_profile` with `confirm: true`. Server loads it in `complain` mode first, agent double-checks the app still works, then a follow-up call switches it to `enforce`.
+*First deploy:*
 
-This is why `apparmor.generate_profile` is in v1 even though it writes something — it's the whole point of use case B, not a "stretch" feature. It just never applies anything without an explicit confirm.
+1. User points the agent at a project's repo ("deploy this app at `/var/www/myapp` with high restriction").
+2. Agent reads the project itself (`package.json`, framework, port it binds, entry point) — that's normal file reading, not an MCP tool. DeployGuard's tools never parse `package.json` or guess a start command themselves; the agent always supplies it as explicit input.
+3. Agent asks the user to pick a restriction level if not already given: **Low / Medium / High** (per plan.md §3.5.1).
+4. Agent calls `apparmor.generate_profile` with `{ path, type: "web-service", level }` — server builds the profile from a template, returns the text, not yet applied. Agent shows it, asks for confirmation, then `apparmor.apply_profile` (`confirm: true`) loads it in `complain` mode first, then `enforce` once the agent/user is satisfied nothing's being falsely denied.
+5. Agent calls `serviceuser.create` (`confirm: true`) — creates a dedicated unprivileged Unix account for the app and re-owns the project directory to it.
+6. Agent calls `systemd.generate_unit` with the service account, the AppArmor profile name, the start command it read from the project, and any resource limits the user wants — reviews the unit with the user, then `systemd.apply_unit` (`confirm: true`) writes it, loads the profile, and starts the service.
+
+*Redeploying an update:*
+
+1. User asks to deploy the latest change ("redeploy myapp" / "deploy the latest update").
+2. Agent calls `deploy.update` (`confirm: true`) — server looks up who actually owns the project directory (not a guessed naming convention), pulls and rebuilds **as that account** via `runuser`, then restarts the systemd unit.
+
+*Managing a deployed app day-to-day (the PM2-equivalent surface):*
+
+1. User asks "list all applications deployed by deployguard" / "what apps are running" — agent calls `apps.list`, which enumerates every `deployguard-*.service` unit regardless of current state.
+2. User asks to stop, restart, or delete a specific app by name — agent calls `apps.stop` / `apps.restart` / `apps.remove` (`confirm: true`) against that unit. `apps.remove` only removes the systemd unit — the project directory, service account, and AppArmor profile are left alone, a deliberately narrower action than a full teardown.
+3. User asks to change an app's CPU/RAM limit — agent calls `apps.update_limits` (`confirm: true`), which rewrites the existing unit with the new limits without needing any new place to store them (the installed unit file is the only state).
+4. User asks for an app's logs — agent calls `apps.get_logs`, a read-only wrapper around `journalctl -u deployguard-<name>.service`.
+
+This is why `apparmor.generate_profile` and the deployment/lifecycle tools are in v1 even though they write something — this guided flow is the actual product, not a "stretch" feature. Nothing gets applied, written, executed, stopped, or deleted without an explicit confirm at each enforce-tier step; `apps.list` and `apps.get_logs` stay confirm-free since they're read-only.
 
 ## 2. Tech Stack
 
@@ -45,10 +59,15 @@ deployguard-mcp/
     ├── apt.ts              # apt.audit_sources
     ├── report.ts           # security.full_report — calls the checks above and merges results
     │
-    └── apparmor.ts        # apparmor.audit, apparmor.generate_profile, apparmor.apply_profile
+    ├── apparmor.ts        # apparmor.audit, apparmor.generate_profile, apparmor.apply_profile
+    ├── serviceuser.ts     # serviceuser.create — dedicated Unix account per app (DAC)
+    ├── systemd.ts          # systemd.generate_unit, systemd.apply_unit — ties DAC + MAC + resource limits together
+    │                       # also exports the unit-file-parsing helper apps.ts reuses (User=/WorkingDirectory=/etc.)
+    ├── deploy.ts           # deploy.update — pull + build + restart as the app's own service user
+    └── apps.ts             # apps.list, apps.stop, apps.restart, apps.remove, apps.update_limits, apps.get_logs
 ```
 
-Still no `adapters/`, no `policy/` layer, no per-type template files — `apparmor.ts` holds three small template strings (one per level: low/medium/high) as plain functions, not a plugin system. If it outgrows one file later, split it then. `firewall.ts` today only knows how to call `ufw`; an `iptables.ts`/`firewalld.ts` alongside it later is an additive change, not a rewrite.
+Still no `adapters/`, no `policy/` layer, no per-type template files — `apparmor.ts` holds three small template strings (one per level: low/medium/high) as plain functions, not a plugin system. If it outgrows one file later, split it then. `firewall.ts` today only knows how to call `ufw`; an `iptables.ts`/`firewalld.ts` alongside it later is an additive change, not a rewrite. Same for `systemd.ts` — one file, one unit template function, no per-framework variants until there's a real second one needed.
 
 ## 4. Tool Pattern
 
@@ -215,6 +234,94 @@ server.registerTool(
 );
 ```
 
+The deployment flow (§1, Use Case B) is three more tools in the same guarded style — a dedicated service account, a systemd unit that ties it to the loaded AppArmor profile plus optional resource limits, and a redeploy tool that never assumes who owns the project directory:
+
+```ts
+// src/serviceuser.ts
+server.registerTool(
+  "serviceuser.create",
+  { description: "Creates a dedicated unprivileged Unix account for an app and re-owns its directory to it.",
+    inputSchema: { path: z.string(), name: z.string(), confirm: z.literal(true) } },
+  async ({ path, name }) => {
+    if (!(await commandExists(name))) { // pseudocode: check via `id <name>` instead in the real impl
+      await run(`useradd --system --no-create-home --shell /usr/sbin/nologin ${name}`);
+    }
+    await run(`chown -R ${name}:${name} ${path}`);
+    return { content: [{ type: "text", text: `Service account ${name} owns ${path}.` }] };
+  }
+);
+```
+
+```ts
+// src/systemd.ts
+server.registerTool(
+  "systemd.apply_unit",
+  { description: "Writes and starts a systemd unit that runs the app as its service account under its AppArmor profile.",
+    inputSchema: {
+      name: z.string(), path: z.string(), user: z.string(), startCommand: z.string(),
+      appArmorProfile: z.string(), cpuQuota: z.string().optional(), memoryMax: z.string().optional(),
+      confirm: z.literal(true),
+    } },
+  async (input) => {
+    const unitName = `deployguard-${input.name}`; // the naming convention apps.ts's listing depends on
+    const unit = buildUnit({ ...input, unitName }); // User=/Group=/WorkingDirectory=/ExecStart=/AppArmorProfile=/CPUQuota=/MemoryMax=
+    await run(`writefile /etc/systemd/system/${unitName}.service`, [unit]); // pseudocode for fs.writeFile
+    await run("systemctl", ["daemon-reload"]);
+    await run("systemctl", ["enable", "--now", unitName]);
+    return { content: [{ type: "text", text: `${unitName}.service running as ${input.user}.` }] };
+  }
+);
+```
+
+```ts
+// src/deploy.ts
+server.registerTool(
+  "deploy.update",
+  { description: "Pulls and rebuilds an already-deployed app as its own service user, then restarts it.",
+    inputSchema: { name: z.string(), path: z.string(), buildCommand: z.string().optional(), confirm: z.literal(true) } },
+  async ({ name, path, buildCommand }) => {
+    const owner = await getOwner(path); // `stat` the directory — the real owner, not a guessed name
+    await run("runuser", ["-u", owner, "--", "bash", "-c", `cd ${path} && git pull && ${buildCommand ?? ""}`]);
+    await run("systemctl", ["restart", `deployguard-${name}`]);
+    return { content: [{ type: "text", text: `${name} redeployed and restarted as ${owner}.` }] };
+  }
+);
+```
+
+The lifecycle tools (§1, "managing a deployed app day-to-day") are thin `systemctl`/`journalctl` wrappers plus one shared helper (`parseUnitFile`, in `systemd.ts`) that both `apps.list` and `apps.update_limits` reuse instead of each re-parsing the installed unit file themselves:
+
+```ts
+// src/apps.ts
+server.registerTool(
+  "apps.list",
+  { description: "Lists every application deployed by DeployGuard and its current status.",
+    outputSchema: { ...checkResultShape, apps: z.array(z.object({
+      name: z.string(), unit: z.string(), active: z.boolean(), enabled: z.boolean(),
+      user: z.string(), path: z.string(), profile: z.string(),
+    })) } },
+  async () => {
+    const unitFiles = await listUnitFiles("/etc/systemd/system", "deployguard-*.service");
+    const apps = await Promise.all(unitFiles.map(async (unitFile) => {
+      const fields = await parseUnitFile(unitFile); // from systemd.ts — User=/WorkingDirectory=/AppArmorProfile=
+      const active = await isActive(fields.unitName);
+      return { name: fields.unitName.replace(/^deployguard-/, ""), unit: fields.unitName, active, ...fields };
+    }));
+    const status = apps.some((a) => !a.active) ? "warn" : "ok";
+    return { content: [{ type: "text", text: summarize(apps) }], structuredContent: { status, summary: summarize(apps), apps } };
+  }
+);
+
+server.registerTool(
+  "apps.get_logs",
+  { description: "Gets recent logs for an app deployed by DeployGuard.",
+    inputSchema: { name: z.string(), lines: z.number().optional() } },
+  async ({ name, lines = 100 }) => {
+    const logs = await run("journalctl", ["-u", `deployguard-${name}`, "-n", String(lines), "--no-pager"]);
+    return { content: [{ type: "text", text: logs }], structuredContent: { logs } };
+  }
+);
+```
+
 ```ts
 // src/index.ts
 const server = new McpServer({ name: "deployguard", version: "0.1.0" });
@@ -224,6 +331,10 @@ registerFail2ban(server);
 registerApt(server);
 registerReport(server);
 registerApparmor(server);
+registerServiceUser(server);
+registerSystemd(server);
+registerDeploy(server);
+registerApps(server);
 await server.connect(new StdioServerTransport());
 ```
 
@@ -272,23 +383,47 @@ Ask the agent: *"Check if this server is ready for DeployGuard."* It calls `syst
 
 Ask the agent: *"Run a security check on this server."* It calls `security.full_report` and returns a pass/warn summary across firewall, fail2ban, and APT sources. (`security.full_report` should itself call `system.check_dependencies` first and skip/flag any check whose tool is missing, rather than erroring.)
 
-### Try it — harden a project
+### Try it — deploy a project
 
-Ask the agent: *"Secure my Next.js app at `/var/www/myapp`."* Expected flow:
+Ask the agent: *"Deploy my Next.js app at `/var/www/myapp` with high restriction."* Expected flow:
 
-1. Agent reads the project directory itself.
-2. Agent asks: "What restriction level — low, medium, or high?"
-3. You answer, e.g. "high."
-4. Agent calls `apparmor.generate_profile` and shows you the result.
-5. You confirm, agent calls `apparmor.apply_profile` in `complain` mode, you verify the app still works, then confirm again to switch to `enforce`.
+1. Agent reads the project directory itself (entry point, start command, port).
+2. Agent asks: "What restriction level — low, medium, or high?" (skip if already given, as above).
+3. Agent calls `apparmor.generate_profile` and shows you the result.
+4. You confirm, agent calls `apparmor.apply_profile` in `complain` mode, then `enforce` once satisfied.
+5. Agent calls `serviceuser.create` (confirm) — creates the app's dedicated Unix account, re-owns the project directory.
+6. Agent calls `systemd.generate_unit` and shows you the unit (start command, the AppArmor profile, any resource limits), then `systemd.apply_unit` (confirm) to write it, load the profile, and start the service.
+
+### Try it — redeploy an update
+
+Push a change to the app's repo, then ask: *"Redeploy myapp"* / *"deploy the latest update."* Expected flow:
+
+1. Agent calls `deploy.update` (confirm) — pulls and rebuilds as the app's own service user (not root), then restarts the systemd unit.
+2. Confirm the change is live, and that the pulled files are owned by the service account, not whoever ran the agent — that's the actual proof the DAC boundary held across a redeploy, not just at first deploy.
+
+### Try it — manage deployed apps (list / stop / restart / remove / limits / logs)
+
+Ask the agent: *"List all applications deployed by DeployGuard."* It calls `apps.list` and enumerates every `deployguard-*.service` unit with its status, service user, path, and AppArmor profile — including apps that are currently stopped, not just running ones.
+
+Then try, against a real app name from that list:
+- *"Stop myapp"* / *"restart myapp"* → `apps.stop` / `apps.restart` (confirm).
+- *"Delete myapp"* → `apps.remove` (confirm) — removes the systemd unit only; confirm the project directory and service account are still there afterwards, since that's deliberate, not a bug.
+- *"Limit myapp to 50% CPU and 512MB RAM"* → `apps.update_limits` (confirm) — confirm via `systemctl show deployguard-myapp --property=CPUQuotaPerSecUSec,MemoryMax` that the limit actually took effect.
+- *"Show me myapp's logs"* → `apps.get_logs` (no confirm needed, read-only) — returns recent `journalctl` output for that unit.
 
 ## 6. What's Deliberately Left Out (for now)
 
-- `firewall.enforce_baseline` and fail2ban jail-config suggestions — read-only for those two areas until app-hardening (the main use case) is solid.
+- `firewall.enforce_baseline` and fail2ban jail-config suggestions — read-only for those two areas until the deployment flow (the main use case) is solid.
 - `iptables`/`firewalld` support — `ufw` only in v1; add as new files alongside `firewall.ts` when needed.
 - Non-Debian OS support (RHEL/Fedora/Arch/etc.) — `system.check_dependencies` should warn and stop rather than attempt unsupported package managers.
 - No sudoers setup automation — if a command needs root, run the server as a user that already has the specific sudo rights it needs; document that per-command as it comes up.
 - No fleet/multi-server support — one server, one host.
 - No config files or allowlists yet (e.g. trusted APT repos) — hardcode a short list in `apt.ts` until it needs to be anything fancier.
+- PM2 (or any other process manager) support — systemd is the only way DeployGuard-deployed apps run; see plan.md §3.5 for why.
+- Multiple apps sharing one service account — one dedicated account per app for now, simpler DAC boundary; revisit only if account sprawl becomes a real problem.
+- Resource type templates beyond `web-service` (`script`, `background-service`, `project-runtime` from plan.md §3.5.1) — added when a real use case needs them, same as the `iptables`/`firewalld` note above.
+- Full teardown (`apps.remove` plus deleting the service account, project files, and AppArmor profile in one action) — `apps.remove` deliberately stays scoped to just the systemd unit; see plan.md §6 Open Questions.
+- Structured/parsed log output — `apps.get_logs` returns raw `journalctl` text, no per-line parsing or filtering beyond `-n`/`--since`.
+- Bulk operations across all apps at once (e.g. "restart everything DeployGuard manages") — each lifecycle tool takes one app name at a time.
 
 Add any of the above only when a real use case needs it.
