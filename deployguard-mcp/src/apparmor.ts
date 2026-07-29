@@ -155,6 +155,26 @@ function alwaysDenyRules(): string {
   ].join("\n");
 }
 
+// Confirmed against a real production Next.js deploy at "high" restriction:
+// these are needed just to *boot* the process, at every level — not
+// stack-specific hardening choices. Without them the app crash-loops (Node
+// exits with EACCES reading OpenSSL's config, which happens even for
+// plain-HTTP servers since the crypto stack still initializes) or silently
+// fails to resolve hostnames. All read-only, so granting them doesn't weaken
+// "high"'s deny-by-default posture for anything else.
+function commonRuntimeFileRules(): string[] {
+  return [
+    "  /etc/ssl/openssl.cnf r,",
+    "  /etc/nsswitch.conf r,",
+    "  /etc/resolv.conf r,",
+    "  /run/resolvconf/resolv.conf r,",
+    "  /proc/version_signature r,",
+    "  /proc/*/cgroup r,",
+    "  /proc/*/mountinfo r,",
+    "  /sys/fs/cgroup/** r,",
+  ];
+}
+
 function filesystemRules(path: string, level: SecurityLevel): string {
   // "ix" (not just "rw") so the app's own binary or shebang'd script inside
   // its own directory can execute regardless of stack — a compiled C++
@@ -162,24 +182,45 @@ function filesystemRules(path: string, level: SecurityLevel): string {
   // live here. This isn't "arbitrary system binary" exec (that's still
   // denied outside this directory at every level) — it's the app itself.
   const own = `  ${path}/** rwix,`;
-  if (level === "high") return own; // own directory only, deny-by-default elsewhere
+  // The directory entry itself, not just globbed contents — Next.js (and
+  // others) stat/list their own project root directory, which "**" alone
+  // doesn't cover.
+  const ownDir = `  ${path}/ r,`;
+  const common = commonRuntimeFileRules();
+
+  if (level === "high") return [own, ownDir, ...common].join("\n");
   if (level === "medium") {
-    return [own, "  /usr/lib/node_modules/** r,", "  /usr/lib/python3*/** r,", "  /etc/resolv.conf r,"].join("\n");
+    return [own, ownDir, "  /usr/lib/node_modules/** r,", "  /usr/lib/python3*/** r,", ...common].join("\n");
   }
-  return [own, "  /usr/** r,", "  /etc/** r,"].join("\n"); // low: broad read access
+  return [own, ownDir, "  /usr/** r,", "  /etc/** r,", ...common].join("\n"); // low: broad read access
 }
 
-function networkRules(level: SecurityLevel): string {
+// libuv's uv_interface_addresses — used by Node (and, via it, Next.js's dev
+// banner printing "Network: http://<lan-ip>:<port>") to enumerate network
+// interfaces — needs a netlink socket plus CAP_NET_ADMIN. Confirmed by the
+// same real deploy: "high" denied this outright and the process never
+// finished starting. Scoped to runtime "node" — Python/compiled binaries
+// don't do this by default, so no need to grant it broadly.
+function runtimeNetworkRules(runtime: Runtime): string[] {
+  if (runtime === "node") {
+    return ["  capability net_admin,", "  network netlink raw,"];
+  }
+  return [];
+}
+
+function networkRules(level: SecurityLevel, runtime: Runtime): string {
+  const extra = runtimeNetworkRules(runtime);
   if (level === "high") {
-    return (
-      "  # only the port this service actually binds — replace with the real port\n" +
-      "  network inet stream,"
-    );
+    return [
+      "  # only the port this service actually binds — replace with the real port",
+      "  network inet stream,",
+      ...extra,
+    ].join("\n");
   }
   if (level === "medium") {
-    return "  network inet stream,\n  network inet6 stream,";
+    return ["  network inet stream,", "  network inet6 stream,", ...extra].join("\n");
   }
-  return "  network,"; // low: unrestricted
+  return ["  network,", ...extra].join("\n"); // low: unrestricted (extra is redundant here but harmless)
 }
 
 // Common install locations for each interpreter, both system-wide and the
@@ -247,7 +288,7 @@ export function buildProfile(path: string, type: ResourceType, level: SecurityLe
     "",
     filesystemRules(path, level),
     "",
-    networkRules(level),
+    networkRules(level, runtime),
     "",
     execRules(level, runtime),
     "",
