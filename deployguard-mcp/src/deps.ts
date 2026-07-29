@@ -7,7 +7,7 @@ import { checkResultShape } from "./schema.js";
 const REQUIRED = [
   { bin: "ufw", installHint: "sudo apt install ufw" },
   { bin: "fail2ban-client", installHint: "sudo apt install fail2ban" },
-  { bin: "aa-status", installHint: "sudo apt install apparmor-utils" },
+  { bin: "aa-status", installHint: "sudo apt install apparmor" },
   { bin: "apt-get", installHint: null }, // ships with Debian/Ubuntu, not expected to be missing
 ];
 
@@ -32,7 +32,7 @@ export function registerCheckDependencies(server: McpServer) {
       description:
         "Checks whether this server/host is ready for DeployGuard security tooling. Call this when the user " +
         "asks if the server is ready, what's installed, or wants a security setup checked. Confirms OS " +
-        "compatibility and that ufw/fail2ban/apparmor-utils are installed.",
+        "compatibility and that ufw/fail2ban/AppArmor tooling are installed.",
       outputSchema: {
         ...checkResultShape,
         debianBased: z.boolean(),
