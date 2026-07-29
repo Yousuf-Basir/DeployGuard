@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerCheckDependencies } from "./deps.js";
+import { registerFirewall } from "./firewall.js";
 
 const server = new McpServer(
   { name: "deployguard", version: "0.1.0" },
@@ -14,5 +15,6 @@ const server = new McpServer(
 );
 
 registerCheckDependencies(server);
+registerFirewall(server);
 
 await server.connect(new StdioServerTransport());
