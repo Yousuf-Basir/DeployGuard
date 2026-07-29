@@ -25,6 +25,29 @@ export async function commandExists(bin: string): Promise<boolean> {
   return output.trim().length > 0;
 }
 
+export interface DependenciesResult {
+  status: "ok" | "warn" | "fail";
+  summary: string;
+  debianBased: boolean;
+  missing: { bin: string; installHint: string }[];
+  [key: string]: unknown;
+}
+
+export async function checkDependencies(): Promise<DependenciesResult> {
+  const isDebianBased = await checkDebianBased();
+  const missing: { bin: string; installHint: string }[] = [];
+  for (const { bin, installHint } of REQUIRED) {
+    if (!(await commandExists(bin)) && installHint) missing.push({ bin, installHint });
+  }
+  const lines = [
+    isDebianBased ? "OK: Debian-based OS" : "WARNING: not a Debian-based OS — v1 only supports Debian/Ubuntu",
+    ...missing.map((m) => `MISSING: ${m.bin} — install with: ${m.installHint}`),
+  ];
+  const summary = lines.join("\n");
+  const status = !isDebianBased ? "fail" : missing.length ? "warn" : "ok";
+  return { status, summary, debianBased: isDebianBased, missing };
+}
+
 export function registerCheckDependencies(server: McpServer) {
   server.registerTool(
     "system.check_dependencies",
@@ -40,20 +63,10 @@ export function registerCheckDependencies(server: McpServer) {
       },
     },
     async () => {
-      const isDebianBased = await checkDebianBased();
-      const missing: { bin: string; installHint: string }[] = [];
-      for (const { bin, installHint } of REQUIRED) {
-        if (!(await commandExists(bin)) && installHint) missing.push({ bin, installHint });
-      }
-      const lines = [
-        isDebianBased ? "OK: Debian-based OS" : "WARNING: not a Debian-based OS — v1 only supports Debian/Ubuntu",
-        ...missing.map((m) => `MISSING: ${m.bin} — install with: ${m.installHint}`),
-      ];
-      const summary = lines.join("\n");
-      const status = !isDebianBased ? "fail" : missing.length ? "warn" : "ok";
+      const result = await checkDependencies();
       return {
-        content: [{ type: "text" as const, text: summary }],
-        structuredContent: { status, summary, debianBased: isDebianBased, missing },
+        content: [{ type: "text" as const, text: result.summary }],
+        structuredContent: result,
       };
     }
   );
