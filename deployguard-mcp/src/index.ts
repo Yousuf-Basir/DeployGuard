@@ -7,6 +7,7 @@ import { registerApt } from "./apt.js";
 import { registerApparmor } from "./apparmor.js";
 import { registerServiceUser } from "./serviceuser.js";
 import { registerSystemd } from "./systemd.js";
+import { registerDeploy } from "./deploy.js";
 import { registerReport } from "./report.js";
 
 const server = new McpServer(
@@ -28,6 +29,7 @@ registerApt(server);
 registerApparmor(server);
 registerServiceUser(server);
 registerSystemd(server);
+registerDeploy(server);
 registerReport(server);
 
 await server.connect(new StdioServerTransport());
