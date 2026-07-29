@@ -90,6 +90,49 @@ export interface ApplyUnitResult {
   [key: string]: unknown;
 }
 
+// The binary the service account actually needs to execute — startCommand's
+// first token, quotes stripped. Best-effort: doesn't handle a startCommand
+// that's itself a shell pipeline ("bash -c '...'"), only the common
+// "/path/to/binary arg1 arg2" case every stage so far has used.
+function execTarget(startCommand: string): string {
+  return startCommand.trim().split(/\s+/)[0]?.replace(/^["']|["']$/g, "") ?? "";
+}
+
+// Confirms the service account can actually reach and execute the binary
+// before the unit is ever written or started — without this, a binary
+// installed under a directory the account can't traverse (the single most
+// common real case: Node installed via nvm under a user's home directory,
+// e.g. /root/.nvm or /home/*/.nvm, which is 0700/0750 and invisible to any
+// other account) silently crash-loops (systemd exit code 203/EXEC) and the
+// only way to find out why is digging through journalctl/dmesg after the
+// fact. Failing here instead turns that into one clear, actionable error.
+async function checkExecutable(user: string, bin: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!bin) return { ok: false, reason: "startCommand is empty — nothing to execute." };
+
+  const existsAsRoot = (await runChecked("test", ["-e", bin])).code === 0;
+  if (!existsAsRoot) {
+    return { ok: false, reason: `"${bin}" (from startCommand) does not exist on this host.` };
+  }
+
+  const canExec = (await runChecked("runuser", ["-u", user, "--", "test", "-x", bin])).code === 0;
+  if (!canExec) {
+    return {
+      ok: false,
+      reason:
+        `service account "${user}" cannot execute "${bin}" — most likely a parent directory isn't ` +
+        "traversable by that account. This is common with Node installed via nvm (e.g. /root/.nvm or " +
+        "/home/*/.nvm are 0700/0750 by default, unreadable to any other account) — nvm is designed for one " +
+        "interactive login shell, not a locked-down system account. Fix by exposing the runtime system-wide " +
+        `instead of relying on the nvm path: e.g. \`ln -s "$(command -v ${bin.split("/").pop()})" /usr/local/bin/${bin
+          .split("/")
+          .pop()}\` (run as the user who has nvm sourced), or install this runtime via your distro's package ` +
+        "manager / NodeSource instead of a per-user version manager. Then retry with the new path.",
+    };
+  }
+
+  return { ok: true };
+}
+
 // Writes the unit, confirms the AppArmor profile it references is actually
 // loaded (checked against apparmor.audit's own view of the kernel state
 // rather than re-running apparmor.apply_profile's write-and-load path,
@@ -106,6 +149,15 @@ export async function applyUnit(input: UnitInput): Promise<ApplyUnitResult> {
       summary:
         `FAIL: AppArmor profile "${input.appArmorProfile}" is not loaded — run apparmor.apply_profile ` +
         "for it first, then retry.",
+      unit,
+    };
+  }
+
+  const execCheck = await checkExecutable(input.user, execTarget(input.startCommand));
+  if (!execCheck.ok) {
+    return {
+      status: "fail",
+      summary: `FAIL: ${execCheck.reason}`,
       unit,
     };
   }
@@ -194,7 +246,10 @@ export function registerSystemd(server: McpServer) {
         "enables and starts it — the step that actually runs the app under DeployGuard's DAC+MAC+systemd " +
         "deployment, replacing PM2 or any other process manager. Call this after the user has reviewed the " +
         "unit from systemd.generate_unit and confirmed they want it deployed for real. Requires the app's " +
-        "service account (serviceuser.create) and AppArmor profile (apparmor.apply_profile) to already exist.",
+        "service account (serviceuser.create) and AppArmor profile (apparmor.apply_profile) to already exist. " +
+        "Fails fast with a specific fix (rather than starting a crash-looping service) if the service account " +
+        "can't actually execute startCommand's binary — the most common cause is a runtime installed via nvm " +
+        "or a similar per-user version manager under a home directory the service account can't traverse.",
       inputSchema: {
         ...unitInputSchema,
         confirm: z.literal(true),
