@@ -99,9 +99,11 @@ export function registerFirewall(server: McpServer) {
     "firewall.check_status",
     {
       description:
-        "Checks which ports are open on this server's firewall and flags anything besides 80/443. " +
-        "Call this when the user asks what ports are open, whether the firewall is configured/enabled, " +
-        "or wants a firewall/network exposure check. Reads ufw status (v1 supports ufw only).",
+        "Checks the firewall (ufw) configuration: which ports it allows through, whether it's enabled at all, " +
+        "and flags anything besides 80/443. Call this for ANY question about ports, firewall rules, or network " +
+        "exposure on this server — e.g. 'what ports are open', 'is the firewall on', 'what can reach this box' " +
+        "— instead of inspecting listening sockets manually (ss/netstat), since firewall state determines what's " +
+        "actually reachable regardless of what's listening. Reads ufw status (v1 supports ufw only).",
       outputSchema: {
         ...checkResultShape,
         openPorts: z.array(z.number()),
