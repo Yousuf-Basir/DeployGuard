@@ -1,6 +1,7 @@
+import { mkdir, writeFile } from "node:fs/promises";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { run } from "./exec.js";
+import { run, runChecked } from "./exec.js";
 import { commandExists } from "./deps.js";
 import { checkResultShape } from "./schema.js";
 
@@ -199,6 +200,74 @@ export function buildProfile(path: string, type: ResourceType, level: SecurityLe
   ].join("\n");
 }
 
+export type ApparmorMode = "complain" | "enforce";
+
+export interface ApplyProfileResult {
+  status: "ok" | "warn" | "fail";
+  summary: string;
+  mode: ApparmorMode;
+  [key: string]: unknown;
+}
+
+// apparmor_parser's long options for forcing a profile's mode regardless of
+// what flags= it was written with — Complain/Enforce, capitalized, unlike
+// the lowercase mode values this tool's own input/output use.
+const PARSER_MODE_FLAG: Record<ApparmorMode, string> = {
+  complain: "--Complain",
+  enforce: "--Enforce",
+};
+
+// Stage 6: writes the profile (rebuilt from the same {path, type, level}
+// inputs Stage 5 already validated, rather than trusting a profile blob
+// passed back in) to its standard location, then loads it into the kernel.
+// Binding it to an actual process is still not this tool's job — that's a
+// systemd unit's AppArmorProfile= (Stage 8).
+export async function applyProfile(
+  path: string,
+  type: ResourceType,
+  level: SecurityLevel,
+  mode: ApparmorMode
+): Promise<ApplyProfileResult> {
+  if (!(await commandExists("apparmor_parser"))) {
+    return {
+      status: "fail",
+      summary: "FAIL: apparmor_parser is not installed — install with: sudo apt install apparmor-utils",
+      mode,
+    };
+  }
+
+  const profile = buildProfile(path, type, level);
+  const file = profileFilePath(path);
+
+  try {
+    await mkdir(PROFILE_DIR, { recursive: true });
+    await writeFile(file, profile, "utf8");
+  } catch (err: any) {
+    return {
+      status: "fail",
+      summary: `FAIL: could not write profile to ${file}: ${err.message ?? err}`,
+      mode,
+    };
+  }
+
+  const { code, stderr } = await runChecked("apparmor_parser", ["-r", PARSER_MODE_FLAG[mode], file]);
+
+  if (code !== 0) {
+    return {
+      status: "fail",
+      summary: `FAIL: apparmor_parser rejected the profile at ${file} (${mode} mode): ${stderr.trim() || "unknown error"}`,
+      mode,
+    };
+  }
+
+  return {
+    status: "ok",
+    summary: `OK: loaded ${file} in ${mode} mode. It confines nothing yet — bind it to a process via a ` +
+      "systemd unit's AppArmorProfile= to actually enforce it.",
+    mode,
+  };
+}
+
 export function registerApparmor(server: McpServer) {
   server.registerTool(
     "apparmor.generate_profile",
@@ -222,6 +291,36 @@ export function registerApparmor(server: McpServer) {
       return {
         content: [{ type: "text" as const, text: profile }],
         structuredContent: { profile },
+      };
+    }
+  );
+
+  server.registerTool(
+    "apparmor.apply_profile",
+    {
+      description:
+        "Writes and loads an AppArmor profile for a project/app directory into the kernel — 'complain' mode " +
+        "just logs violations, 'enforce' mode actually blocks them. Call this after the user has reviewed a " +
+        "profile from apparmor.generate_profile and confirmed they want it applied for real. Always try " +
+        "'complain' mode first to check for false-positive denials before switching to 'enforce'. Note: loading " +
+        "the profile alone doesn't confine any running process yet — that needs a systemd unit to reference it.",
+      inputSchema: {
+        path: z.string(),
+        type: z.enum(["web-service"]),
+        level: z.enum(["low", "medium", "high"]),
+        mode: z.enum(["complain", "enforce"]),
+        confirm: z.literal(true),
+      },
+      outputSchema: {
+        ...checkResultShape,
+        mode: z.enum(["complain", "enforce"]),
+      },
+    },
+    async ({ path, type, level, mode }) => {
+      const result = await applyProfile(path, type, level, mode);
+      return {
+        content: [{ type: "text" as const, text: result.summary }],
+        structuredContent: result,
       };
     }
   );
