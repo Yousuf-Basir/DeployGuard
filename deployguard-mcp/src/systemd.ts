@@ -4,6 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { runChecked } from "./exec.js";
 import { checkResultShape } from "./schema.js";
 import { checkApparmorAudit } from "./apparmor.js";
+import { commandExists } from "./deps.js";
 
 export interface UnitInput {
   name: string;
@@ -124,15 +125,63 @@ async function checkExecutable(user: string, bin: string): Promise<{ ok: true } 
         "traversable by that account. This is common with Node/Python installed via a per-user version " +
         "manager (nvm, pyenv) under a home directory that's 0700/0750 by default (e.g. /root/.nvm, " +
         "/home/*/.nvm) — those tools are designed for one interactive login shell, not a locked-down system " +
-        `account. Fix by COPYING the binary out to a system-wide location — \`cp "$(command -v ${binName})" ` +
-        `/usr/local/bin/${binName} && chmod 755 /usr/local/bin/${binName}\` — not a symlink: a symlink still ` +
-        "resolves through the original restricted directory when the service account tries to open it, so it " +
-        "fails the exact same way. Installing the runtime via your distro's package manager/NodeSource instead " +
-        "of a per-user version manager avoids this entirely. Then retry with the new path.",
+        `account. Retry this same call with grantAccess: true to have DeployGuard grant "${user}" execute-only ` +
+        "(traversal, not read/list) access on just the directories leading to this binary via setfacl — the " +
+        "rest of that home directory stays hidden. Alternatively, copy the binary out to a system-wide " +
+        `location yourself — \`cp "$(command -v ${binName})" /usr/local/bin/${binName}\` — but note a symlink ` +
+        "won't work: it still resolves through the original restricted directory, hitting this same wall.",
     };
   }
 
   return { ok: true };
+}
+
+// Every directory from just below "/" down to the binary's own parent —
+// setfacl needs an entry on each one, since traversal permission is checked
+// at every level independently, not just the final directory.
+function ancestorDirs(filePath: string): string[] {
+  const parts = filePath.split("/").filter(Boolean);
+  const dirs: string[] = [];
+  let acc = "";
+  for (let i = 0; i < parts.length - 1; i++) {
+    acc += "/" + parts[i];
+    dirs.push(acc);
+  }
+  return dirs;
+}
+
+// Grants the service account execute-only (traversal) access via a POSIX
+// ACL on each directory leading to `bin`, instead of copying the binary
+// somewhere world-reachable. Execute-only means the account can walk
+// through to this one file — it still can't `ls` the directory or read
+// anything else inside it. Confirmed on the test VPS: this lets a service
+// account run node straight out of /root/.nvm/versions/node/vX.Y.Z/bin/
+// while `ls /root` as that account still fails.
+async function grantTraverseAccess(
+  user: string,
+  bin: string
+): Promise<{ ok: true; dirs: string[] } | { ok: false; reason: string }> {
+  if (!(await commandExists("setfacl"))) {
+    return { ok: false, reason: "setfacl is not installed — install with: sudo apt install acl, then retry." };
+  }
+
+  const dirs = ancestorDirs(bin);
+  for (const dir of dirs) {
+    const { code, stderr } = await runChecked("setfacl", ["-m", `u:${user}:x`, dir]);
+    if (code !== 0) {
+      return { ok: false, reason: `setfacl -m u:${user}:x ${dir} failed: ${stderr.trim() || "unknown error"}` };
+    }
+  }
+  return { ok: true, dirs };
+}
+
+export interface ApplyUnitInput extends UnitInput {
+  // Opt-in and separate from `confirm` — this specifically authorizes
+  // touching ACLs on directories outside the project (potentially another
+  // user's home directory, e.g. /root), which is a meaningfully different
+  // and more surprising action than "start my app," so it needs its own
+  // explicit yes rather than riding along on the general confirm.
+  grantAccess?: boolean;
 }
 
 // Writes the unit, confirms the AppArmor profile it references is actually
@@ -140,7 +189,7 @@ async function checkExecutable(user: string, bin: string): Promise<{ ok: true } 
 // rather than re-running apparmor.apply_profile's write-and-load path,
 // since this tool only has a profile *name*, not the {path,type,level}
 // apply_profile needs to rebuild one from scratch), then starts it.
-export async function applyUnit(input: UnitInput): Promise<ApplyUnitResult> {
+export async function applyUnit(input: ApplyUnitInput): Promise<ApplyUnitResult> {
   const unit = unitName(input.name);
   const audit = await checkApparmorAudit();
   const profile = audit.profiles.find((p) => p.name === input.appArmorProfile);
@@ -155,7 +204,19 @@ export async function applyUnit(input: UnitInput): Promise<ApplyUnitResult> {
     };
   }
 
-  const execCheck = await checkExecutable(input.user, execTarget(input.startCommand));
+  const bin = execTarget(input.startCommand);
+  let execCheck = await checkExecutable(input.user, bin);
+  let grantedDirs: string[] | undefined;
+
+  if (!execCheck.ok && input.grantAccess) {
+    const grant = await grantTraverseAccess(input.user, bin);
+    if (!grant.ok) {
+      return { status: "fail", summary: `FAIL: ${grant.reason}`, unit };
+    }
+    grantedDirs = grant.dirs;
+    execCheck = await checkExecutable(input.user, bin);
+  }
+
   if (!execCheck.ok) {
     return {
       status: "fail",
@@ -197,12 +258,15 @@ export async function applyUnit(input: UnitInput): Promise<ApplyUnitResult> {
     profile.mode === "complain"
       ? ` Note: the profile is still in complain mode — it logs violations but doesn't block them yet.`
       : "";
+  const aclNote = grantedDirs
+    ? ` Granted ${input.user} execute-only traversal via setfacl on: ${grantedDirs.join(", ")}.`
+    : "";
 
   return {
     status: "ok",
     summary:
       `OK: ${unit}.service written, loaded, and started as ${input.user} under AppArmor profile ` +
-      `${input.appArmorProfile}.${modeNote}`,
+      `${input.appArmorProfile}.${modeNote}${aclNote}`,
     unit,
   };
 }
@@ -251,10 +315,25 @@ export function registerSystemd(server: McpServer) {
         "service account (serviceuser.create) and AppArmor profile (apparmor.apply_profile) to already exist. " +
         "Fails fast with a specific fix (rather than starting a crash-looping service) if the service account " +
         "can't actually execute startCommand's binary — the most common cause is a runtime installed via nvm " +
-        "or a similar per-user version manager under a home directory the service account can't traverse.",
+        "or a similar per-user version manager under a home directory the service account can't traverse. If " +
+        "that happens, retry with grantAccess: true to have DeployGuard grant minimal execute-only (traversal) " +
+        "ACL access on just the blocking directories via setfacl, instead of copying the binary elsewhere — " +
+        "this lets the app run the runtime straight out of its real install location (e.g. an nvm/pyenv path) " +
+        "even if that's under another user's home directory.",
       inputSchema: {
         ...unitInputSchema,
         confirm: z.literal(true),
+        grantAccess: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe(
+            "Only needed if a prior call failed because the service account couldn't reach startCommand's " +
+              "binary. When true, grants that account execute-only (not read/list) traversal access via setfacl " +
+              "on each directory leading to the binary — e.g. /root, /root/.nvm, .../versions/node/vX.Y.Z, " +
+              ".../bin — so it can run the runtime from its real location without copying it. The rest of that " +
+              "directory tree stays inaccessible to the account."
+          ),
       },
       outputSchema: {
         ...checkResultShape,
