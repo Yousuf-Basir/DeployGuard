@@ -167,6 +167,8 @@ function commonRuntimeFileRules(): string[] {
     "  /etc/ssl/openssl.cnf r,",
     "  /etc/nsswitch.conf r,",
     "  /etc/resolv.conf r,",
+    "  /etc/host.conf r,",
+    "  /etc/hosts r,",
     "  /run/resolvconf/resolv.conf r,",
     "  /proc/version_signature r,",
     "  /proc/*/cgroup r,",
@@ -175,7 +177,25 @@ function commonRuntimeFileRules(): string[] {
   ];
 }
 
-function filesystemRules(path: string, level: SecurityLevel): string {
+// Runtime-specific filesystem needs beyond the universal baseline above.
+// Confirmed against a real Flask deploy at "medium": a package installed
+// via system pip (outside a venv) lands under /usr/local/lib/python3*/
+// dist-packages, not /usr/lib (OS-owned packages only) — and pip's own
+// console-script wrappers (e.g. /usr/local/bin/flask, the literal
+// ExecStart target) need to be *read* by whoever launches them; a
+// shebang script's interpreter line is read by the kernel and then again
+// by the interpreter itself, separate from the interpreter's own exec
+// permission (already granted by runtimeExecRules). "mr" not just "r" on
+// the dist-packages tree — many packages ship compiled C extensions
+// (.so) loaded via mmap(PROT_EXEC), which needs "m" specifically.
+function runtimeFileRules(runtime: Runtime): string[] {
+  if (runtime === "python") {
+    return ["  /usr/local/lib/python3*/** mr,", "  /usr/local/bin/** r,"];
+  }
+  return [];
+}
+
+function filesystemRules(path: string, level: SecurityLevel, runtime: Runtime): string {
   // "ix" (not just "rw") so the app's own binary or shebang'd script inside
   // its own directory can execute regardless of stack — a compiled C++
   // binary, a venv's local interpreter copy, or a project-local script all
@@ -187,12 +207,17 @@ function filesystemRules(path: string, level: SecurityLevel): string {
   // doesn't cover.
   const ownDir = `  ${path}/ r,`;
   const common = commonRuntimeFileRules();
+  const runtimeExtra = runtimeFileRules(runtime);
 
-  if (level === "high") return [own, ownDir, ...common].join("\n");
+  if (level === "high") return [own, ownDir, ...common, ...runtimeExtra].join("\n");
   if (level === "medium") {
-    return [own, ownDir, "  /usr/lib/node_modules/** r,", "  /usr/lib/python3*/** r,", ...common].join("\n");
+    return [own, ownDir, "  /usr/lib/node_modules/** r,", "  /usr/lib/python3*/** r,", ...common, ...runtimeExtra].join(
+      "\n"
+    );
   }
-  return [own, ownDir, "  /usr/** r,", "  /etc/** r,", ...common].join("\n"); // low: broad read access
+  // low: broad read access already covers /usr/local/**, so runtimeExtra
+  // would be redundant here — included anyway for one consistent code path.
+  return [own, ownDir, "  /usr/** r,", "  /etc/** r,", ...common, ...runtimeExtra].join("\n");
 }
 
 // libuv's uv_interface_addresses — used by Node (and, via it, Next.js's dev
@@ -208,6 +233,14 @@ function runtimeNetworkRules(runtime: Runtime): string[] {
   return [];
 }
 
+// Granted at every level, not a per-level tradeoff: DNS resolution over UDP
+// is basic plumbing, not an optional feature, for any runtime that resolves
+// hostnames (which is effectively all of them). Confirmed against a real
+// Flask deploy at "medium" — glibc's resolver needs to *create* a UDP
+// socket to actually query the nameserver in /etc/resolv.conf; read access
+// on that file (commonRuntimeFileRules) alone doesn't help without this.
+const DNS_NETWORK_RULES = ["  network inet dgram,", "  network inet6 dgram,"];
+
 function networkRules(level: SecurityLevel, runtime: Runtime): string {
   const extra = runtimeNetworkRules(runtime);
   if (level === "high") {
@@ -222,13 +255,14 @@ function networkRules(level: SecurityLevel, runtime: Runtime): string {
       // out, rather than failing fast. That's worse than a deny-and-stop
       // failure, so this is granted at every level, not just medium/low.
       "  network inet6 stream,",
+      ...DNS_NETWORK_RULES,
       ...extra,
     ].join("\n");
   }
   if (level === "medium") {
-    return ["  network inet stream,", "  network inet6 stream,", ...extra].join("\n");
+    return ["  network inet stream,", "  network inet6 stream,", ...DNS_NETWORK_RULES, ...extra].join("\n");
   }
-  return ["  network,", ...extra].join("\n"); // low: unrestricted (extra is redundant here but harmless)
+  return ["  network,", ...extra].join("\n"); // low: unrestricted (DNS/extra both redundant here but harmless)
 }
 
 // Common install locations for each interpreter, both system-wide and the
@@ -294,7 +328,7 @@ export function buildProfile(path: string, type: ResourceType, level: SecurityLe
     `profile ${name} flags=(attach_disconnected) {`,
     "  #include <abstractions/base>",
     "",
-    filesystemRules(path, level),
+    filesystemRules(path, level, runtime),
     "",
     networkRules(level, runtime),
     "",
