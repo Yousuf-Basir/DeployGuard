@@ -173,6 +173,16 @@ function commonRuntimeFileRules(): string[] {
     "  /proc/version_signature r,",
     "  /proc/*/cgroup r,",
     "  /proc/*/mountinfo r,",
+    // Confirmed against a real deploy at "high": libuv's uv_resident_set_memory
+    // (backing Node's process.memoryUsage(), which is common enough to hit in
+    // almost any real app — health checks, GC-aware code, monitoring hooks)
+    // reads /proc/self/statm, which resolves to /proc/<own-pid>/statm. Without
+    // this the process doesn't just log a denial, it crashes outright.
+    // /stat and /status are the same self-introspection family and denied for
+    // the same reason, so included alongside rather than fixed one at a time.
+    "  /proc/*/stat r,",
+    "  /proc/*/statm r,",
+    "  /proc/*/status r,",
     "  /sys/fs/cgroup/** r,",
   ];
 }
