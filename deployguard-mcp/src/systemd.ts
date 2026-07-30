@@ -254,19 +254,30 @@ export async function applyUnit(input: ApplyUnitInput): Promise<ApplyUnitResult>
     };
   }
 
-  const modeNote =
-    profile.mode === "complain"
-      ? ` Note: the profile is still in complain mode — it logs violations but doesn't block them yet.`
-      : "";
   const aclNote = grantedDirs
     ? ` Granted ${input.user} execute-only traversal via setfacl on: ${grantedDirs.join(", ")}.`
     : "";
+
+  if (profile.mode === "complain") {
+    return {
+      // "warn", not "ok" — the unit is running, but the app is NOT
+      // actually confined yet. Don't let a caller read "the systemd step
+      // succeeded" as "the deployment is secured."
+      status: "warn",
+      summary:
+        `WARNING: ${unit}.service is written and running as ${input.user}, but its AppArmor profile ` +
+        `(${input.appArmorProfile}) is still in COMPLAIN mode — it is not actually confined. Check ` +
+        "apparmor.audit or the app's logs for denials, then call apparmor.apply_profile again with " +
+        `mode: 'enforce' before telling the user this app is secured.${aclNote}`,
+      unit,
+    };
+  }
 
   return {
     status: "ok",
     summary:
       `OK: ${unit}.service written, loaded, and started as ${input.user} under AppArmor profile ` +
-      `${input.appArmorProfile}.${modeNote}${aclNote}`,
+      `${input.appArmorProfile} (enforce mode).${aclNote}`,
     unit,
   };
 }

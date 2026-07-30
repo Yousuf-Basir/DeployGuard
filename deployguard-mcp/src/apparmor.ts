@@ -409,10 +409,26 @@ export async function applyProfile(
     };
   }
 
+  if (mode === "complain") {
+    return {
+      // "warn", not "ok" — complain mode blocks nothing at all. A caller
+      // reading only `status` (not the full sentence) should still see
+      // this isn't a finished, secured state.
+      status: "warn",
+      summary:
+        `WARNING: loaded ${file} in complain mode — this logs violations but BLOCKS NOTHING. The app is not ` +
+        "confined yet, regardless of what restriction level was chosen. Bind it to a process via a systemd " +
+        "unit's AppArmorProfile=, start/restart it, check apparmor.audit or the app's logs for denials, then " +
+        "call apparmor.apply_profile again with mode: 'enforce' before considering this deployment done — do " +
+        "not stop here.",
+      mode,
+    };
+  }
+
   return {
     status: "ok",
-    summary: `OK: loaded ${file} in ${mode} mode. It confines nothing yet — bind it to a process via a ` +
-      "systemd unit's AppArmorProfile= to actually enforce it.",
+    summary: `OK: loaded ${file} in enforce mode. Bind it to a process via a systemd unit's AppArmorProfile= ` +
+      "to actually confine it (if not already bound).",
     mode,
   };
 }
@@ -461,8 +477,15 @@ export function registerApparmor(server: McpServer) {
         "Writes and loads an AppArmor profile for a project/app directory into the kernel — 'complain' mode " +
         "just logs violations, 'enforce' mode actually blocks them. Call this after the user has reviewed a " +
         "profile from apparmor.generate_profile and confirmed they want it applied for real. Always try " +
-        "'complain' mode first to check for false-positive denials before switching to 'enforce'. Note: loading " +
-        "the profile alone doesn't confine any running process yet — that needs a systemd unit to reference it.",
+        "'complain' mode first, start/restart the app, and check apparmor.audit or the app's own logs for " +
+        "denials — but this is a STRICT two-step requirement, not a stopping point: a deployment is not done " +
+        "while the profile is still in complain mode, since complain mode blocks nothing at all — the app " +
+        "looks deployed and 'secure' (systemd active, high/medium/low profile loaded) while every single access " +
+        "is silently allowed through. Once no unexpected denials show up, you MUST call this tool again with " +
+        "mode: 'enforce' in the same session before telling the user the app is secured. Never end a deployment " +
+        "or redeploy task with an app's profile left in complain mode — check apparmor.audit before declaring " +
+        "success if there's any doubt. Note: loading the profile alone doesn't confine any running process yet " +
+        "— that needs a systemd unit to reference it.",
       inputSchema: {
         path: z.string(),
         type: z.enum(["web-service"]),

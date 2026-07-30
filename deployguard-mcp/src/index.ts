@@ -23,7 +23,14 @@ const server = new McpServer(
       "security.full_report rather than each individual check. Call system.check_dependencies first if unsure " +
       "whether the required CLI tools are installed. For deploying, redeploying, or managing an app (list, " +
       "stop, restart, remove, adjust limits, view logs), prefer serviceuser.create/apparmor.*/systemd.*/" +
-      "deploy.update/apps.* over reconstructing the same actions with raw shell commands.",
+      "deploy.update/apps.* over reconstructing the same actions with raw shell commands. STRICT RULE: an " +
+      "AppArmor profile applied with apparmor.apply_profile in 'complain' mode blocks NOTHING — it only logs " +
+      "what would be denied. A deployment is never finished while a profile is left in complain mode, no " +
+      "matter how high the restriction level, and no matter that the systemd service is running. Always " +
+      "follow a complain-mode apply with checking apparmor.audit/the app's logs for denials, then explicitly " +
+      "call apparmor.apply_profile again with mode: 'enforce' before reporting an app as deployed or secured. " +
+      "If asked whether an app is secure, or before ending a deploy/redeploy task, check apparmor.audit — a " +
+      "profile still in complain mode is a warning, not a success.",
   }
 );
 
