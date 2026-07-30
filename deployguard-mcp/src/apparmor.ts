@@ -190,7 +190,14 @@ function commonRuntimeFileRules(): string[] {
 // (.so) loaded via mmap(PROT_EXEC), which needs "m" specifically.
 function runtimeFileRules(runtime: Runtime): string[] {
   if (runtime === "python") {
-    return ["  /usr/local/lib/python3*/** mr,", "  /usr/local/bin/** r,"];
+    // The bare directory entries too, not just their globbed contents — the
+    // interpreter/importer stats and lists these directories directly,
+    // same reason the project's own directory needed its own "ownDir" rule.
+    return [
+      "  /usr/local/lib/python3*/** mr,",
+      "  /usr/local/bin/ r,",
+      "  /usr/local/bin/** r,",
+    ];
   }
   return [];
 }
