@@ -214,6 +214,14 @@ function networkRules(level: SecurityLevel, runtime: Runtime): string {
     return [
       "  # only the port this service actually binds — replace with the real port",
       "  network inet stream,",
+      // Confirmed against a real deploy (Node/Express's default app.listen(port)
+      // with no explicit host binds a dual-stack IPv6 socket, which also serves
+      // IPv4 clients) — without this, the socket still creates and LISTENs, but
+      // AppArmor denies every accept() on it, and the runtime keeps retrying in
+      // a tight loop: near-100% CPU, and every connection hangs until it times
+      // out, rather than failing fast. That's worse than a deny-and-stop
+      // failure, so this is granted at every level, not just medium/low.
+      "  network inet6 stream,",
       ...extra,
     ].join("\n");
   }
