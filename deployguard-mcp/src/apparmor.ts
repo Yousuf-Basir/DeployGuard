@@ -289,13 +289,20 @@ function networkRules(level: SecurityLevel, runtime: Runtime): string {
 // suffixes/symlinks (python3.11, node -> nodejs) without a rule per variant.
 function runtimeExecRules(runtime: Runtime): string[] {
   if (runtime === "node") {
+    // "rix", not just "ix" — confirmed against a real deploy using
+    // worker_threads: spawning a worker re-opens the node binary for a
+    // plain read, separate from the exec-transition "ix" already covers.
+    // Apps that never spawn worker threads won't notice the difference
+    // (the earlier "ix"-only rule worked fine for plain Express apps),
+    // but this is strictly more capable and no less restrictive on any
+    // other axis, so it's not worth a separate opt-in.
     return [
       "  # Node.js — common system and per-user version-manager (nvm) locations",
-      "  /usr/bin/node* ix,",
-      "  /usr/local/bin/node* ix,",
-      "  /opt/*/bin/node* ix,",
-      "  /root/.nvm/versions/node/*/bin/node* ix,",
-      "  /home/*/.nvm/versions/node/*/bin/node* ix,",
+      "  /usr/bin/node* rix,",
+      "  /usr/local/bin/node* rix,",
+      "  /opt/*/bin/node* rix,",
+      "  /root/.nvm/versions/node/*/bin/node* rix,",
+      "  /home/*/.nvm/versions/node/*/bin/node* rix,",
     ];
   }
   if (runtime === "python") {
