@@ -4,6 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { runChecked } from "./exec.js";
 import { checkResultShape } from "./schema.js";
 import { UNIT_DIR, unitName, unitFilePath, buildUnit, parseUnitFile } from "./systemd.js";
+import { checkApparmorAudit } from "./apparmor.js";
 
 const UNIT_FILE_RE = /^deployguard-.*\.service$/;
 
@@ -205,6 +206,78 @@ export async function getLogs(name: string, lines: number, since?: string): Prom
   return { logs: stdout || stderr };
 }
 
+async function restartCount(unit: string): Promise<number> {
+  const { stdout } = await runChecked("systemctl", ["show", unit, "--property=NRestarts", "--value"]);
+  const n = Number(stdout.trim());
+  return Number.isFinite(n) ? n : 0;
+}
+
+export interface VerifyAppResult {
+  status: "ok" | "warn" | "fail";
+  summary: string;
+  active: boolean;
+  appArmorProfile: string;
+  appArmorMode: "enforce" | "complain" | "kill" | "unconfined" | "not-loaded";
+  restartCount: number;
+  logs: string;
+  [key: string]: unknown;
+}
+
+// The check for "is this deployment actually good" — not just "did the
+// last action report success." A systemd unit can be `active` while its
+// AppArmor profile sits in complain mode indefinitely (confirmed as a real
+// case: a deployed app whose profile nobody ever switched to enforce after
+// the initial "try complain first" step), or while it's crash-looping and
+// restarting on its own. Call this any time, not just right after a
+// deploy — it's what catches drift on an app that's been running a while.
+export async function verifyApp(name: string): Promise<VerifyAppResult> {
+  const missing = await requireExists(name);
+  if (missing) {
+    return { ...missing, active: false, appArmorProfile: "", appArmorMode: "not-loaded", restartCount: 0, logs: "" };
+  }
+
+  const unit = unitName(name);
+  const file = unitFilePath(name);
+  const content = await readFile(file, "utf8");
+  const parsed = parseUnitFile(`${unit}.service`, content);
+
+  const [active, restarts, audit, logsResult] = await Promise.all([
+    isActive(unit),
+    restartCount(unit),
+    checkApparmorAudit(),
+    getLogs(name, 30),
+  ]);
+
+  const profile = audit.profiles.find((p) => p.name === parsed.appArmorProfile);
+  const appArmorMode: VerifyAppResult["appArmorMode"] = profile ? profile.mode : "not-loaded";
+  // "kill" is stricter than "enforce" (violations kill the process outright),
+  // not weaker — only complain/unconfined/not-loaded mean nothing's actually
+  // being blocked.
+  const isConfined = appArmorMode === "enforce" || appArmorMode === "kill";
+
+  const problems: string[] = [];
+  if (!active) problems.push("the service is not active");
+  if (!isConfined) problems.push(`its AppArmor profile is in ${appArmorMode} mode, not enforce`);
+  if (restarts > 0) problems.push(`it has restarted ${restarts} time(s) since it was last (re)started`);
+
+  const status: "ok" | "warn" | "fail" = !active ? "fail" : problems.length ? "warn" : "ok";
+  const summary = problems.length
+    ? `${status === "fail" ? "FAIL" : "WARNING"}: ${name} — ${problems.join("; ")}. Recent logs are included — ` +
+      "check them for actual application errors, which this check can't judge on its own."
+    : `OK: ${name} is active, its AppArmor profile (${parsed.appArmorProfile}) is enforced, and it hasn't ` +
+      "restarted. Still worth a glance at recent logs for anything application-specific.";
+
+  return {
+    status,
+    summary,
+    active,
+    appArmorProfile: parsed.appArmorProfile,
+    appArmorMode,
+    restartCount: restarts,
+    logs: logsResult.logs,
+  };
+}
+
 export function registerApps(server: McpServer) {
   server.registerTool(
     "apps.list",
@@ -331,6 +404,38 @@ export function registerApps(server: McpServer) {
       const result = await getLogs(name, lines ?? 100, since);
       return {
         content: [{ type: "text" as const, text: result.logs }],
+        structuredContent: result,
+      };
+    }
+  );
+
+  server.registerTool(
+    "apps.verify",
+    {
+      description:
+        "Checks whether a DeployGuard-deployed app is ACTUALLY healthy and secured right now — not just " +
+        "whether it's running. Confirms the systemd service is active, its AppArmor profile is in enforce " +
+        "(not complain — complain mode blocks nothing, so an app can look deployed while completely " +
+        "unconfined) or kill mode, and whether it's been restarting on its own (a sign of crash-looping). " +
+        "Returns recent logs too, for judgment calls this check can't make on its own (application-specific " +
+        "errors). Call this after any deploy/redeploy before telling the user the app is secured or working, " +
+        "when asked if an app is secure/healthy/working correctly, or periodically on apps that were deployed " +
+        "a while ago — a profile silently left in complain mode, or an app quietly crash-looping, won't show " +
+        "up in apps.list (which only reports active/inactive) or a plain systemctl status check.",
+      inputSchema: { name: z.string() },
+      outputSchema: {
+        ...checkResultShape,
+        active: z.boolean(),
+        appArmorProfile: z.string(),
+        appArmorMode: z.enum(["enforce", "complain", "kill", "unconfined", "not-loaded"]),
+        restartCount: z.number(),
+        logs: z.string(),
+      },
+    },
+    async ({ name }) => {
+      const result = await verifyApp(name);
+      return {
+        content: [{ type: "text" as const, text: `${result.summary}\n\n${result.logs}`.trim() }],
         structuredContent: result,
       };
     }

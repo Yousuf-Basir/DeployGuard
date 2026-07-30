@@ -88,8 +88,27 @@ export interface ApplyUnitResult {
   status: "ok" | "warn" | "fail";
   summary: string;
   unit: string;
+  logs?: string;
   [key: string]: unknown;
 }
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function isActive(unit: string): Promise<boolean> {
+  const { stdout } = await runChecked("systemctl", ["is-active", unit]);
+  return stdout.trim() === "active";
+}
+
+// A unit that fails immediately (missing dependency, bad ExecStart, an
+// AppArmor denial the pre-flight checks couldn't predict) still makes
+// `systemctl enable --now` exit 0 — that command only confirms systemd
+// *accepted* the request, not that the process stayed up. Waiting briefly
+// and re-checking is what actually catches a crash-on-start instead of
+// reporting "OK, started" for a service that's already dead by the time
+// the caller reads the response.
+const START_SETTLE_MS = 1500;
 
 // The binary the service account actually needs to execute — startCommand's
 // first token, quotes stripped. Best-effort: doesn't handle a startCommand
@@ -254,6 +273,25 @@ export async function applyUnit(input: ApplyUnitInput): Promise<ApplyUnitResult>
     };
   }
 
+  // enable --now exiting 0 only means systemd accepted the start request —
+  // it says nothing about whether the process is still alive a moment
+  // later. Catch an immediate crash (bad startCommand, an AppArmor denial
+  // the pre-flight checks couldn't have known about, a missing runtime
+  // dependency) here instead of reporting success for an already-dead unit.
+  await sleep(START_SETTLE_MS);
+  if (!(await isActive(unit))) {
+    const { stdout } = await runChecked("journalctl", ["-u", unit, "-n", "30", "--no-pager"]);
+    return {
+      status: "fail",
+      summary:
+        `FAIL: ${unit}.service was started but is not running ${START_SETTLE_MS}ms later — it crashed ` +
+        "immediately. See logs for the actual error (a bad startCommand, a missing runtime dependency, or an " +
+        "AppArmor denial the pre-flight checks couldn't predict are the most common causes).",
+      unit,
+      logs: stdout,
+    };
+  }
+
   const aclNote = grantedDirs
     ? ` Granted ${input.user} execute-only traversal via setfacl on: ${grantedDirs.join(", ")}.`
     : "";
@@ -330,7 +368,10 @@ export function registerSystemd(server: McpServer) {
         "that happens, retry with grantAccess: true to have DeployGuard grant minimal execute-only (traversal) " +
         "ACL access on just the blocking directories via setfacl, instead of copying the binary elsewhere — " +
         "this lets the app run the runtime straight out of its real install location (e.g. an nvm/pyenv path) " +
-        "even if that's under another user's home directory.",
+        "even if that's under another user's home directory. After starting the unit, waits briefly and " +
+        "re-checks it's still running — a unit that crashes immediately (bad startCommand, missing runtime " +
+        "dependency, an AppArmor denial the pre-flight checks couldn't predict) is reported as a failure with " +
+        "the actual crash logs, not as a false 'started successfully'.",
       inputSchema: {
         ...unitInputSchema,
         confirm: z.literal(true),
@@ -349,12 +390,14 @@ export function registerSystemd(server: McpServer) {
       outputSchema: {
         ...checkResultShape,
         unit: z.string(),
+        logs: z.string().optional(),
       },
     },
     async (input) => {
       const result = await applyUnit(input);
+      const text = result.logs ? `${result.summary}\n\n${result.logs}` : result.summary;
       return {
-        content: [{ type: "text" as const, text: result.summary }],
+        content: [{ type: "text" as const, text }],
         structuredContent: result,
       };
     }

@@ -30,7 +30,11 @@ const server = new McpServer(
       "follow a complain-mode apply with checking apparmor.audit/the app's logs for denials, then explicitly " +
       "call apparmor.apply_profile again with mode: 'enforce' before reporting an app as deployed or secured. " +
       "If asked whether an app is secure, or before ending a deploy/redeploy task, check apparmor.audit — a " +
-      "profile still in complain mode is a warning, not a success.",
+      "profile still in complain mode is a warning, not a success. Call apps.verify as the standard closing " +
+      "step after any deploy, redeploy, or config change to an app — it checks active state, AppArmor " +
+      "enforcement, and restart/crash-loop count in one call, and is also the right tool when asked if an " +
+      "already-deployed app is secure/healthy, since apps.list alone (active/inactive only) won't catch a " +
+      "profile silently left in complain mode or a crash-looping service.",
   }
 );
 

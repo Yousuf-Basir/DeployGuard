@@ -11,6 +11,21 @@ export interface DeployUpdateResult {
   [key: string]: unknown;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function isActive(unit: string): Promise<boolean> {
+  const { stdout } = await runChecked("systemctl", ["is-active", unit]);
+  return stdout.trim() === "active";
+}
+
+// systemctl restart exiting 0 only means the restart was accepted, not
+// that the new build actually stayed running — a redeploy that pulls in a
+// broken commit would otherwise report "OK, restarted" for a service
+// that's already crash-looping on the new code.
+const RESTART_SETTLE_MS = 1500;
+
 // The real owner is the source of truth, not a guessed naming convention —
 // serviceuser.create (Stage 7) may have re-owned the directory to an
 // account whose name doesn't exactly match `name`, and trusting a mismatch
@@ -63,9 +78,23 @@ export async function deployUpdate(name: string, path: string, buildCommand?: st
     };
   }
 
+  // Catches a redeploy that pulls in code that crashes on start — the
+  // restart command itself succeeding doesn't mean the new build stayed up.
+  await sleep(RESTART_SETTLE_MS);
+  if (!(await isActive(unit))) {
+    const { stdout } = await runChecked("journalctl", ["-u", unit, "-n", "30", "--no-pager"]);
+    return {
+      status: "fail",
+      summary:
+        `FAIL: pulled and built successfully as "${owner}", but ${unit}.service crashed within ` +
+        `${RESTART_SETTLE_MS}ms of restarting on the new code. The pulled commit is likely broken — see logs.`,
+      output: `${pullOutput}\n\n--- post-restart crash logs ---\n${stdout}`.trim(),
+    };
+  }
+
   return {
     status: "ok",
-    summary: `OK: pulled and built as "${owner}", ${unit}.service restarted.`,
+    summary: `OK: pulled and built as "${owner}", ${unit}.service restarted and confirmed running.`,
     output: pullOutput,
   };
 }
@@ -81,7 +110,9 @@ export function registerDeploy(server: McpServer) {
         "directory's actual owning account (via runuser) — never as root or whichever account is running this " +
         "MCP server — so the DAC isolation serviceuser.create set up isn't broken by files landing under the " +
         "wrong owner. If the pull or build fails, the running service is left untouched rather than restarted " +
-        "into a broken state.",
+        "into a broken state. Also verifies the restarted service is still running a moment later — a redeploy " +
+        "that pulls in a commit which crashes on startup is reported as a failure with the crash logs, not as " +
+        "a false 'restarted successfully'.",
       inputSchema: {
         name: z.string(),
         path: z.string(),
